@@ -1,0 +1,8 @@
+DUMP_FILE="/home/user/backups/postgres/pgbackup_trade-postgresql_MyDB_20240101_120000.dump"
+CONTAINER="psqlt3"          # 你的容器名
+DB_USER="sean"
+DB_NAME="MyDB"
+DB_PASSWORD="111111"
+
+cat "$DUMP_FILE" | docker exec -i -e "PGPASSWORD=$DB_PASSWORD" "$CONTAINER" \
+  pg_restore -U "$DB_USER" -d "$DB_NAME" --clean --if-exists
