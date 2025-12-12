@@ -10,7 +10,8 @@ DELETE_OVERRIDE="" # 1 -> force sync (delete extras), 0 -> force copy, empty -> 
 DRY_RUN=0
 SELECTED_JOBS=()
 RCLONE_BIN="${RCLONE_BIN:-rclone}"
-RCLONE_GLOBAL_FLAGS=(${RCLONE_GLOBAL_FLAGS:-})
+RCLONE_GLOBAL_FLAGS=()
+RCLONE_CONFIG_FILE="${RCLONE_CONFIG_FILE:-}"
 
 usage() {
     cat <<'EOF'
@@ -26,8 +27,9 @@ Options:
 
 Config:
   BACKUP_JOBS=(JOB_A JOB_B)
-  JOB_A_TYPE=SSH|S3|REMOTE   # SSH means build :sftp, S3 builds :s3 remote, REMOTE uses provided remote string
+  JOB_A_TYPE=SSH|S3|REMOTE   # optional; default S3. SSH builds :sftp, S3 builds :s3, REMOTE uses provided remote string
   JOB_A_SRC=/path/to/source
+  JOB_A_MODE=copy|sync       # optional; overrides JOB_A_DELETE
   # SSH
   JOB_A_SSH_HOST=example.com
   JOB_A_SSH_PATH=/srv/backups/job_a
@@ -49,6 +51,9 @@ Config:
   # REMOTE (for pre-configured rclone remotes)
   JOB_C_DESTINATION=myremote:/path
   # Common optional flags
+  RCLONE_BIN=rclone
+  RCLONE_GLOBAL_FLAGS="--transfers 8 --checkers 8"
+  RCLONE_CONFIG_FILE=/path/to/rclone.conf (optional)
   JOB_A_DELETE=true|false     # per job delete/sync mode
   JOB_A_RCLONE_FLAGS="--transfers 8 --checkers 8"
 EOF
@@ -70,6 +75,12 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || fail "Missing required command: $cmd"
 }
 
+require_arg() {
+    local opt=$1
+    local val=${2-}
+    [ -n "$val" ] || fail "Option $opt requires an argument"
+}
+
 bool_val() {
     local val="${1:-}"
     shopt -s nocasematch
@@ -79,6 +90,10 @@ bool_val() {
         echo 0
     fi
     shopt -u nocasematch
+}
+
+mask_sensitive() {
+    echo "$1" | sed -E 's/(access_key_id=)[^,]+/\1***/g; s/(secret_access_key=)[^,]+/\1***/g; s/(session_token=)[^,]+/\1***/g'
 }
 
 job_var() {
@@ -111,10 +126,12 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -c|--config)
+                require_arg "$1" "${2-}"
                 CONFIG_FILE=$2
                 shift 2
                 ;;
             -j|--jobs)
+                require_arg "$1" "${2-}"
                 IFS=',' read -r -a SELECTED_JOBS <<<"$2"
                 shift 2
                 ;;
@@ -145,6 +162,14 @@ load_config() {
     [ -f "$CONFIG_FILE" ] || fail "Config file not found: $CONFIG_FILE"
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
+    RCLONE_BIN=${RCLONE_BIN:-"rclone"}
+    # shellcheck disable=SC2206
+    RCLONE_GLOBAL_FLAGS=(${RCLONE_GLOBAL_FLAGS:-})
+    RCLONE_CONFIG_FILE=${RCLONE_CONFIG_FILE:-}
+    local home_dir="${HOME:-}"
+    if [ -z "$RCLONE_CONFIG_FILE" ] && [ -n "$home_dir" ] && [ -f "$home_dir/.config/rclone/rclone.conf" ]; then
+        RCLONE_CONFIG_FILE="$home_dir/.config/rclone/rclone.conf"
+    fi
     if ! declare -p BACKUP_JOBS >/dev/null 2>&1; then
         fail "BACKUP_JOBS array not defined in $CONFIG_FILE"
     fi
@@ -166,9 +191,15 @@ should_run_job() {
 
 build_s3_destination() {
     local job_key=$1
-    local provider endpoint bucket path region ak sk token force_path_style storage_class acl
-    provider=$(require_job_var "$job_key" "S3_PROVIDER")
-    endpoint=$(job_var "$job_key" "S3_ENDPOINT")
+    local provider endpoint_raw endpoint bucket path region ak sk token force_path_style storage_class acl
+    provider=$(job_var "$job_key" "S3_PROVIDER")
+    provider=${provider:-S3}
+    endpoint_raw=$(job_var "$job_key" "S3_ENDPOINT")
+    endpoint="$endpoint_raw"
+    if [[ "$endpoint" =~ ^https?:// ]]; then
+        endpoint="${endpoint#http://}"
+        endpoint="${endpoint#https://}"
+    fi
     bucket=$(require_job_var "$job_key" "S3_BUCKET")
     path=$(job_var "$job_key" "S3_PATH")
     region=$(job_var "$job_key" "S3_REGION")
@@ -178,6 +209,12 @@ build_s3_destination() {
     force_path_style=$(job_var "$job_key" "S3_FORCE_PATH_STYLE")
     storage_class=$(job_var "$job_key" "S3_STORAGE_CLASS")
     acl=$(job_var "$job_key" "S3_ACL")
+
+    if [ -z "$force_path_style" ]; then
+        case "$(echo "$provider" | tr '[:upper:]' '[:lower:]')" in
+            cloudflare|backblaze) force_path_style=true ;;
+        esac
+    fi
 
     local dest=":s3,provider=${provider},access_key_id=${ak},secret_access_key=${sk}"
     [ -n "$endpoint" ] && dest+=",endpoint=${endpoint}"
@@ -225,7 +262,8 @@ build_remote_destination() {
 compute_destination() {
     local job_key=$1
     local type
-    type=$(require_job_var "$job_key" "TYPE")
+    type=$(job_var "$job_key" "TYPE")
+    type=${type:-S3}
     type=$(echo "$type" | tr '[:lower:]' '[:upper:]')
     case "$type" in
         S3) build_s3_destination "$job_key" ;;
@@ -239,17 +277,23 @@ compute_destination() {
 
 run_job() {
     local job_key=$1
-    local src dest job_delete rclone_cmd extra_flags
+    local src dest mode job_delete rclone_cmd extra_flags
     src=$(require_job_var "$job_key" "SRC")
     dest=$(compute_destination "$job_key")
     extra_flags=$(job_var "$job_key" "RCLONE_FLAGS")
 
-    if [ ! -d "$src" ]; then
-        fail "Job $job_key source directory not found: $src"
-    fi
-
+    mode=$(job_var "$job_key" "MODE")
+    mode=$(echo "$mode" | tr '[:upper:]' '[:lower:]')
     if [ -n "$DELETE_OVERRIDE" ]; then
         job_delete=$DELETE_OVERRIDE
+    elif [ -n "$mode" ]; then
+        case "$mode" in
+            sync) job_delete=1 ;;
+            copy) job_delete=0 ;;
+            *)
+                fail "Job $job_key has invalid MODE '$mode' (expected copy|sync)"
+                ;;
+        esac
     else
         job_delete=$(bool_val "$(job_var "$job_key" "DELETE")")
     fi
@@ -260,9 +304,20 @@ run_job() {
         rclone_cmd="copy"
     fi
 
-    log INFO "Job $job_key -> $dest (${rclone_cmd})"
+    if [ "$rclone_cmd" = "sync" ]; then
+        [ -d "$src" ] || fail "Job $job_key source directory not found: $src"
+    else
+        [ -e "$src" ] || fail "Job $job_key source path not found: $src"
+    fi
+
+    local dest_masked
+    dest_masked=$(mask_sensitive "$dest")
+    log INFO "Job $job_key -> $dest_masked (${rclone_cmd})"
 
     local cmd=("$RCLONE_BIN" "$rclone_cmd" "$src" "$dest" --fast-list --create-empty-src-dirs)
+    if [ -n "$RCLONE_CONFIG_FILE" ]; then
+        cmd+=(--config "$RCLONE_CONFIG_FILE")
+    fi
     if [ "$DRY_RUN" -eq 1 ]; then
         cmd+=(--dry-run)
     fi
@@ -280,8 +335,8 @@ run_job() {
 
 main() {
     parse_args "$@"
-    require_cmd "$RCLONE_BIN"
     load_config
+    require_cmd "$RCLONE_BIN"
 
     local job_raw job_key
     for job_raw in "${BACKUP_JOBS[@]}"; do
