@@ -11,6 +11,7 @@ UPLOAD_TARGETS=()
 RCLONE_BIN="rclone"
 RCLONE_GLOBAL_FLAGS=()
 RCLONE_CONFIG_FILE=""
+SLACK_WEBHOOK_URL=""
 
 usage() {
     cat <<'EOF'
@@ -28,6 +29,7 @@ Optional:
   BACKUP_PREFIX    prefix for filename (default: pgbackup)
   DOCKER_BIN       docker executable (default: docker)
   PG_DUMP_OPTIONS  extra options passed to pg_dump (e.g., "--clean --if-exists")
+  SLACK_WEBHOOK_URL Slack webhook URL for notifications (optional)
 
 Upload targets (optional):
   UPLOAD_TARGETS=(S3_MAIN SSH_MIRROR ...)
@@ -61,8 +63,36 @@ log() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
+send_slack() {
+    local status="$1"
+    local message="$2"
+
+    if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+        return 0
+    fi
+
+    local icon="✅"
+    if [ "$status" != "SUCCESS" ]; then
+        icon="❌"
+    fi
+
+    # Escape double quotes and newlines for JSON
+    local safe_message
+    safe_message=$(echo "$message" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+
+    local text="$icon *Backup $status* - Host: $(hostname)\n$safe_message"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] Slack: $text"
+        return 0
+    fi
+
+    curl -s -X POST -H 'Content-type: application/json' --data "{\"text\": \"$text\"}" "$SLACK_WEBHOOK_URL" >/dev/null || true
+}
+
 fail() {
     log "ERROR: $*"
+    send_slack "FAILURE" "Error: $*"
     exit 1
 }
 
@@ -143,6 +173,7 @@ load_config() {
     # shellcheck disable=SC2206
     RCLONE_GLOBAL_FLAGS=(${RCLONE_GLOBAL_FLAGS:-})
     RCLONE_CONFIG_FILE=${RCLONE_CONFIG_FILE:-}
+    SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
     if [ -z "$RCLONE_CONFIG_FILE" ]; then
         if [ -f "$HOME/.config/rclone/rclone.conf" ]; then
             RCLONE_CONFIG_FILE="$HOME/.config/rclone/rclone.conf"
@@ -381,6 +412,7 @@ main() {
     run_dump
     prune_old_backups
     upload_all_targets
+    send_slack "SUCCESS" "Backup completed successfully.\nFile: $(basename "$LATEST_BACKUP_FILE")"
 }
 
 main "$@"

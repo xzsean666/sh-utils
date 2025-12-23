@@ -11,7 +11,7 @@ BACKUP_ROOT_DIR=""
 MAX_BACKUPS=7
 EXCLUDE_PARAMS=()
 COMPRESSION_LEVEL=3
-
+SLACK_WEBHOOK_URL=""
 # Function to show usage
 usage() {
     echo "Usage: $0 --config <path_to_config_file>"
@@ -22,6 +22,20 @@ usage() {
     echo "Example:"
     echo "  $0 --config ./my_backup_config.env"
     exit 1
+}
+
+# Function to send Slack message
+send_slack_message() {
+    local message="$1"
+    if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        # Check if curl is installed
+        if command -v curl &> /dev/null; then
+            echo "Sending Slack notification..."
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$message\"}" "$SLACK_WEBHOOK_URL" > /dev/null
+        else
+            echo "Warning: curl is not installed. Cannot send Slack notification."
+        fi
+    fi
 }
 
 # Parse command line arguments
@@ -112,8 +126,11 @@ if [ $? -eq 0 ]; then
     # Get file size
     FILE_SIZE=$(du -h "$BACKUP_FILEPATH" | cut -f1)
     echo "Backup Size: $FILE_SIZE"
+
+    send_slack_message "✅ Backup Successful: $SOURCE_BASENAME\nFile: $BACKUP_FILENAME\nSize: $FILE_SIZE"
 else
     echo "❌ Backup failed!"
+    send_slack_message "❌ Backup Failed: $SOURCE_BASENAME"
     exit 1
 fi
 
